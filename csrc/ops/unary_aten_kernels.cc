@@ -25,25 +25,30 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "c10/core/MemoryFormat.h"
 #include "c10/core/ScalarType.h"
 #include "csrc/common/aten_utils.h"
 #include "csrc/common/cache_key.h"
 #include "csrc/common/device_type.h"
 #include "csrc/common/dtype.h"
 #include "csrc/common/error_utils.h"
+#include "csrc/common/layout_utils.h"
 #include "csrc/common/macro_utils.h"  // IWYU pragma: keep
 #include "csrc/common/to_string.h"
+#include "csrc/common/utils.h"
 #include "csrc/eager/op_dispatcher.h"
 #include "csrc/eager/tensor_to_buffer.h"
 #include "csrc/ops/macros/kernel.h"
 #include "csrc/ops/op_builder_utils.h"
 #include "csrc/ops/op_names.h"
 #include "csrc/ops/unary.h"
+#include "csrc/ops/view_decomposition/contiguous_to_view.h"  // NOLINT
 #include "mlir/IR/BuiltinTypes.h"
 #include "stablehlo/dialect/StablehloOps.h"
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "stablehlo/integrations/cpp/builder/MlirBuilder.h"  // IWYU pragma: keep
 #include "stablehlo/integrations/cpp/builder/StablehloBuilder.h"
+#include "torch/headeronly/core/MemoryFormat.h"
 #include "torch/headeronly/core/ScalarType.h"
 
 // A "Simple Unary" op is an Aten op that:
@@ -130,6 +135,36 @@ absl::StatusOr<at::Tensor> UnaryOp(const at::Tensor& self,
            .out_dims = output_dims,
            .computation_dtype = options.computation_dtype,
            .op_param_cache_keys = std::move(options.op_param_cache_keys)}));
+  if (!options.out_dims.has_value()) {
+    switch (options.memory_format) {
+      case at::MemoryFormat::Preserve: {
+        const Strides target_strides = options.use_empty_like_strides
+                                           ? EmptyLikeStrides(self)
+                                           : UnaryOpStrides(self);
+        return ContiguousToView(std::move(result_buf), target_strides,
+                                /*target_storage_offset=*/0);
+      }
+      case at::MemoryFormat::ChannelsLast: {
+        ABSL_CHECK_EQ(self.dim(), 4)  // CRASH_OK
+            << "ChannelsLast memory format requires a 4D tensor.";
+        return ContiguousToView(
+            std::move(result_buf),
+            CopyIntVector(c10::get_channels_last_strides_2d(self.sizes())),
+            /*target_storage_offset=*/0);
+      }
+      case at::MemoryFormat::ChannelsLast3d: {
+        ABSL_CHECK_EQ(self.dim(), 5)  // CRASH_OK
+            << "ChannelsLast3d memory format requires a 5D tensor.";
+        return ContiguousToView(
+            std::move(result_buf),
+            CopyIntVector(c10::get_channels_last_strides_3d(self.sizes())),
+            /*target_storage_offset=*/0);
+      }
+      case at::MemoryFormat::Contiguous:
+      default:
+        break;
+    }
+  }
   return MakeTensor(std::move(result_buf));
 }
 absl::StatusOr<at::Tensor> UnaryOp(const at::Tensor& self, OpName op_name,

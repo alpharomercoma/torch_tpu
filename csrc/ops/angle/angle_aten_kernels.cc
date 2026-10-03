@@ -83,7 +83,8 @@ at::Tensor AtenAngle(const at::Tensor& self) {
         auto result, UnaryOp(self, BuildAngleShlo,
                              {.op_param_cache_keys = OpParamCacheKeys::Empty(),
                               .out_dtype = out_element_type,
-                              .computation_dtype = computation_dtype}));
+                              .computation_dtype = computation_dtype,
+                              .use_empty_like_strides = true}));
     return result;
   });
 }

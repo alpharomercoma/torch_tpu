@@ -24423,6 +24423,288 @@ class OpsGradUnitTest(TorchTpuVsCpuTestBase):
             atol=1e-4,
         )
 
+  @parameterized.named_parameters(
+      ("transposed", "transposed"),
+      ("sliced", "sliced"),
+      ("expanded", "expanded"),
+      ("channels_last", "channels_last"),
+      ("empty_transposed", "empty_transposed"),
+  )
+  def test_non_out_functional_ops_strides_match_meta(self, layout: str) -> None:
+    """Tests that non-.out functional ops match Meta (FakeTensor) strides."""
+    torch.manual_seed(0)
+    base_shape = {
+        "transposed": (4, 3, 5),
+        "sliced": (4, 6, 8),
+        "expanded": (1, 3, 5),
+        "channels_last": (2, 3, 4, 5),
+        "empty_transposed": (4, 0, 5),
+    }[layout]
+    leaf_x = torch.randn(base_shape, dtype=torch.float32)
+    leaf_y = torch.randn(base_shape, dtype=torch.float32).abs() + 1.0
+    leaf_exp = torch.randint(-2, 3, base_shape, dtype=torch.int32)
+
+    def to_strided(leaf: torch.Tensor, device: str) -> torch.Tensor:
+      t = leaf.to(device)
+      if layout in ("transposed", "empty_transposed"):
+        return t.transpose(0, 2)
+      if layout == "sliced":
+        return t[:, ::2, :5]
+      if layout == "expanded":
+        return t.expand(4, 3, 5)
+      return t.to(memory_format=torch.channels_last)
+
+    def run_deterministic_ops(device: str) -> dict[str, torch.Tensor]:
+      x = to_strided(leaf_x, device)
+      y = to_strided(leaf_y, device)
+      y_contig = y.contiguous()
+      exp = to_strided(leaf_exp, device)
+      exp_contig = exp.contiguous()
+      exp_bcast = torch.ones(
+          (1,) * (x.ndim - 1) + (x.shape[-1],),
+          device=device,
+          dtype=torch.int32,
+      )
+      mask = x > 0
+      return {
+          "relu": torch.relu(x),
+          "gelu": torch.nn.functional.gelu(x),
+          "hardswish": torch.nn.functional.hardswish(x),
+          "isnan": torch.isnan(x),
+          "angle": torch.angle(x),
+          "logcumsumexp": torch.logcumsumexp(x, dim=-1),
+          "floor_divide_same": torch.floor_divide(x, y),
+          "floor_divide_scalar": torch.floor_divide(x, 2.0),
+          "floor_divide_int_mixed": torch.floor_divide(exp, exp_bcast + 2),
+          "ldexp_same": torch.ldexp(x, exp),
+          "ldexp_mixed": torch.ldexp(x, exp_contig),
+          "ldexp_bcast": torch.ldexp(x, exp_bcast),
+          "ldexp_int_same": torch.ldexp(exp, exp),
+          "ldexp_int_mixed": torch.ldexp(exp, exp_contig),
+          "remainder_scalar_tensor": torch.ops.aten.remainder.Scalar_Tensor(
+              5.0, y
+          ),
+          "silu_backward_same": torch.ops.aten.silu_backward(y, x),
+          "silu_backward_mixed": torch.ops.aten.silu_backward(y_contig, x),
+          "hardswish_backward_same": torch.ops.aten.hardswish_backward(y, x),
+          "hardswish_backward_mixed": torch.ops.aten.hardswish_backward(
+              y_contig, x
+          ),
+          "native_dropout_backward": torch.ops.aten.native_dropout_backward(
+              y, mask, 1.25
+          ),
+      }
+
+    with fake_tensor.FakeTensorMode(allow_non_fake_inputs=True):
+      meta_outs = run_deterministic_ops("tpu")
+    cpu_outs = run_deterministic_ops("cpu")
+
+    for mode in (
+        execution_mode.EagerMode.DEFER_NEVER,
+        execution_mode.EagerMode.DEFER_AND_FUSE,
+    ):
+      with (
+          self.subTest(f"mode={mode.name}"),
+          execution_mode.set_eager_mode(mode),
+      ):
+        tpu_outs = run_deterministic_ops("tpu")
+
+        for name, tpu_out in tpu_outs.items():
+          with self.subTest(f"{name}_stride"):
+            self.assertEqual(tpu_out.stride(), meta_outs[name].stride())
+          with self.subTest(f"{name}_values"):
+            self.assert_close(
+                golden_result=cpu_outs[name],
+                torch_tpu_result=tpu_out.cpu(),
+                rtol=1e-4,
+                atol=1e-4,
+            )
+
+        for p, train in ((0.0, True), (0.5, False), (0.5, True), (1.0, True)):
+          with self.subTest(f"native_dropout_p={p}_train={train}"):
+            x_tpu = to_strided(leaf_x, "tpu")
+            out_tpu, mask_tpu = torch.ops.aten.native_dropout(x_tpu, p, train)
+            with fake_tensor.FakeTensorMode(allow_non_fake_inputs=True):
+              x_meta = to_strided(leaf_x, "tpu")
+              out_meta, mask_meta = torch.ops.aten.native_dropout(
+                  x_meta, p, train
+              )
+            self.assertEqual(out_tpu.stride(), out_meta.stride())
+            self.assertEqual(mask_tpu.stride(), mask_meta.stride())
+            if not train or p == 0.0 or p == 1.0:
+              x_cpu = to_strided(leaf_x, "cpu")
+              out_cpu, mask_cpu = torch.ops.aten.native_dropout(x_cpu, p, train)
+              self.assert_close(
+                  golden_result=out_cpu,
+                  torch_tpu_result=out_tpu.cpu(),
+                  rtol=1e-4,
+                  atol=1e-4,
+              )
+              if mask_cpu.dtype == mask_tpu.dtype:
+                self.assert_close(
+                    golden_result=mask_cpu,
+                    torch_tpu_result=mask_tpu.cpu(),
+                )
+
+  @parameterized.named_parameters(
+      ("static", False),
+      ("dynamic", True),
+  )
+  def test_compiled_view_after_non_out_ops_on_strided_input(
+      self, dynamic: bool
+  ) -> None:
+    """Tests that compiled views after non-.out ops on strided inputs work."""
+
+    def fn(
+        x_base: torch.Tensor,
+        y_base: torch.Tensor,
+        grad_cl: torch.Tensor,
+        mask_cl: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+      x = x_base.transpose(0, 1)
+      y = (y_base.abs() + 1.0).transpose(0, 1)
+      h = torch.relu(x)
+      h = torch.nn.functional.gelu(h)
+      h = torch.nn.functional.hardswish(h)
+      # logcumsumexp overrides UnaryOp Preserve default with Contiguous, so its
+      # output is contiguous and can be directly viewed without transposition.
+      logcumsum = torch.logcumsumexp(x, dim=0).view(-1)
+      q = torch.floor_divide(x.detach(), y.detach())
+      fwd_out = (h + q).transpose(0, 1).view(-1)
+      # hardswish_backward with strided grad_output and self
+      hw_grad = torch.ops.aten.hardswish_backward(y, x).transpose(0, 1).view(-1)
+      # native_dropout_backward with channels_last inputs
+      drop_grad = (
+          torch.ops.aten.native_dropout_backward(grad_cl, mask_cl, 1.25)
+          .permute(0, 2, 3, 1)
+          .view(-1)
+      )
+      return fwd_out, logcumsum, hw_grad, drop_grad
+
+    torch.manual_seed(42)
+    x_base_cpu = torch.randn(16, 8, requires_grad=True)
+    y_base_cpu = torch.randn(16, 8)
+    grad_cl_cpu = torch.randn(2, 3, 4, 5).to(memory_format=torch.channels_last)
+    mask_cl_cpu = (grad_cl_cpu > 0).to(memory_format=torch.channels_last)
+
+    cpu_fwd, cpu_logcumsum, cpu_hw_grad, cpu_drop_grad = fn(
+        x_base_cpu, y_base_cpu, grad_cl_cpu, mask_cl_cpu
+    )
+    (cpu_fwd.sum() + cpu_logcumsum.sum()).backward()
+
+    x_base = x_base_cpu.detach().to("tpu").requires_grad_(True)
+    y_base = y_base_cpu.to("tpu")
+    grad_cl = grad_cl_cpu.to("tpu")
+    mask_cl = mask_cl_cpu.to("tpu")
+
+    backend = "aot_eager" if dynamic else "tpu"
+    compiled_fn = torch.compile(fn, dynamic=dynamic, backend=backend)
+    out, logcumsum, hw_grad, drop_grad = compiled_fn(
+        x_base, y_base, grad_cl, mask_cl
+    )
+    (out.sum() + logcumsum.sum()).backward()
+    torch.accelerator.synchronize()
+
+    self.assertEqual(out.shape, (128,))
+    self.assertEqual(logcumsum.shape, (128,))
+    self.assertEqual(hw_grad.shape, (128,))
+    self.assertEqual(drop_grad.shape, (120,))
+    self.assertIsNotNone(x_base.grad)
+    self.assertEqual(x_base.grad.shape, (16, 8))
+
+    self.assert_close(
+        golden_result=cpu_fwd,
+        torch_tpu_result=out.cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    self.assert_close(
+        golden_result=cpu_logcumsum,
+        torch_tpu_result=logcumsum.cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    self.assert_close(
+        golden_result=cpu_hw_grad,
+        torch_tpu_result=hw_grad.cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    self.assert_close(
+        golden_result=cpu_drop_grad,
+        torch_tpu_result=drop_grad.cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+    self.assert_close(
+        golden_result=x_base_cpu.grad,
+        torch_tpu_result=x_base.grad.cpu(),
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+  def test_hardswish_backward_and_ldexp_strides_with_mixed_layouts(
+      self,
+  ) -> None:
+    """Tests stride propagation with expanded self and transposed other."""
+    torch.manual_seed(0)
+
+    # self has shape (2, 3, 4) with expanded zero-stride in dim 1: (4, 0, 1)
+    # other / grad_output has transposed strides: (12, 1, 3)
+    leaf_self_f = torch.randn(2, 1, 4)
+    leaf_grad_f = torch.randn(2, 4, 3)
+    leaf_self_i = torch.randint(-2, 3, (2, 1, 4), dtype=torch.int32)
+    leaf_other_i = torch.randint(-2, 3, (2, 4, 3), dtype=torch.int32)
+
+    def make_inputs(
+        device: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+      self_f = leaf_self_f.to(device).expand(2, 3, 4)
+      grad_f = leaf_grad_f.to(device).transpose(1, 2)
+      self_i = leaf_self_i.to(device).expand(2, 3, 4)
+      other_i = leaf_other_i.to(device).transpose(1, 2)
+      return self_f, grad_f, self_i, other_i
+
+    with fake_tensor.FakeTensorMode(allow_non_fake_inputs=True):
+      self_f_m, grad_f_m, self_i_m, other_i_m = make_inputs("tpu")
+      hw_meta = torch.ops.aten.hardswish_backward(grad_f_m, self_f_m)
+      ldexp_meta = torch.ldexp(self_i_m, other_i_m)
+
+    self.assertEqual(hw_meta.stride(), (12, 4, 1))
+    self.assertEqual(ldexp_meta.stride(), (12, 4, 1))
+
+    self_f_cpu, grad_f_cpu, self_i_cpu, other_i_cpu = make_inputs("cpu")
+    hw_cpu = torch.ops.aten.hardswish_backward(grad_f_cpu, self_f_cpu)
+    ldexp_cpu = torch.ldexp(self_i_cpu, other_i_cpu)
+
+    for mode in (
+        execution_mode.EagerMode.DEFER_NEVER,
+        execution_mode.EagerMode.DEFER_AND_FUSE,
+    ):
+      with (
+          self.subTest(f"mode={mode.name}"),
+          execution_mode.set_eager_mode(mode),
+      ):
+        self_f_tpu, grad_f_tpu, self_i_tpu, other_i_tpu = make_inputs("tpu")
+        hw_tpu = torch.ops.aten.hardswish_backward(grad_f_tpu, self_f_tpu)
+        ldexp_tpu = torch.ldexp(self_i_tpu, other_i_tpu)
+
+        self.assertEqual(hw_tpu.stride(), hw_meta.stride())
+        self.assertEqual(ldexp_tpu.stride(), ldexp_meta.stride())
+
+        self.assert_close(
+            golden_result=hw_cpu,
+            torch_tpu_result=hw_tpu.cpu(),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+        self.assert_close(
+            golden_result=ldexp_cpu,
+            torch_tpu_result=ldexp_tpu.cpu(),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+
 
 class OpTestingFrameworkTest(op_testing.OpInfoTestBase):
   """Tests for the op_testing framework itself."""
