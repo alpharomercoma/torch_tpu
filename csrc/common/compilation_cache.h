@@ -82,13 +82,20 @@ struct CacheEntryStats {
 
 class CompilationCache;
 
+using OutputLayoutsPromise =
+    std::promise<std::vector<std::optional<CustomLayout>>>;
+using OutputLayoutsFuture =
+    std::shared_future<std::vector<std::optional<CustomLayout>>>;
+
 // A cache entry, which is a future executable with its metadata.
 // Invariant: executable_future is associated with executable_promise.
 class CacheEntry {
  public:
   CacheEntry()
       : executable_promise_(std::make_shared<LoadedExecutablePromise>()),
-        executable_future_(executable_promise_->get_future().share()) {}
+        executable_future_(executable_promise_->get_future().share()),
+        output_layouts_promise_(std::make_shared<OutputLayoutsPromise>()),
+        output_layouts_future_(output_layouts_promise_->get_future().share()) {}
 
   // This class is movable but not copyable.
   CacheEntry(CacheEntry&&) = default;
@@ -106,6 +113,15 @@ class CacheEntry {
     return executable_promise_;
   }
 
+  [[nodiscard]] const OutputLayoutsFuture& output_layouts_future() const {
+    return output_layouts_future_;
+  }
+
+  [[nodiscard]] const std::shared_ptr<OutputLayoutsPromise>&
+  output_layouts_promise() const {
+    return output_layouts_promise_;
+  }
+
   [[nodiscard]] CacheEntryStats& stats() const { return stats_; }
 
  private:
@@ -113,6 +129,8 @@ class CacheEntry {
   // and destroyed after it.
   std::shared_ptr<LoadedExecutablePromise> executable_promise_;
   SharedLoadedExecutableWithMetadataFuture executable_future_;
+  std::shared_ptr<OutputLayoutsPromise> output_layouts_promise_;
+  OutputLayoutsFuture output_layouts_future_;
   mutable CacheEntryStats stats_;
 };
 
@@ -374,6 +392,8 @@ class CompilationCache {
   struct CacheLookupInternal {
     absl_nonnull std::shared_ptr<LoadedExecutablePromise> executable_promise;
     SharedLoadedExecutableWithMetadataFuture executable_future;
+    absl_nonnull std::shared_ptr<OutputLayoutsPromise> output_layouts_promise;
+    OutputLayoutsFuture output_layouts_future;
     std::optional<ShapeDynamismMetadata> shape_dynamism_metadata;
     bool needs_compilation = false;
     bool dump_on_cache_miss = false;

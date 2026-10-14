@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <future>
 #include <ios>
@@ -73,10 +74,14 @@
 #include "csrc/internal/dynamism/dynamism_ops.h"
 #include "csrc/ops/op_builder_utils.h"
 #include "csrc/pjrt/pjrt_state.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/MLIRContext.h"
+#include "mlir/Support/LLVM.h"
 #include "stablehlo/integrations/cpp/builder/AttrTypeBuilderUtil.h"
 #include "tsl/platform/numbers.h"
 #include "xla/hlo/utils/concurrency/concurrency_utils.h"
+#include "xla/pjrt/layout_mode.h"
 #include "xla/pjrt/pjrt_client.h"
 #include "xla/pjrt/pjrt_compiler.h"
 #include "xla/pjrt/pjrt_device_dimensions.h"
@@ -285,6 +290,23 @@ static void TrySetExecutablePromise(
   }
 }
 
+static void TrySetOutputLayoutsPromise(
+    const CompilationCacheKey& key, OutputLayoutsPromise& promise,
+    std::vector<std::optional<CustomLayout>> layouts) {
+  try {
+    promise.set_value(std::move(layouts));
+    ABSL_VLOG(1) << "Set output layouts for key: " << key;
+  } catch (const std::future_error& e) {
+    if (e.code() == std::future_errc::promise_already_satisfied) {
+      ABSL_VLOG(1) << "Another thread already set output layouts for key: "
+                   << key;
+    } else {
+      ABSL_LOG(FATAL)  // CRASH_OK=TorchTPU bug
+          << "Unexpected future_error: " << e.what();
+    }
+  }
+}
+
 void CompilationCache::EvictAll() {
   {
     auto stats = GetCacheStats();
@@ -448,6 +470,8 @@ CompilationCache::GetCacheEntry(const CompilationCacheKey& key,
   return CacheLookupInternal{
       .executable_promise = cache_entry->executable_promise(),
       .executable_future = cache_entry->executable_future(),
+      .output_layouts_promise = cache_entry->output_layouts_promise(),
+      .output_layouts_future = cache_entry->output_layouts_future(),
       .needs_compilation = false,
       .dump_on_cache_miss = false,
   };
@@ -474,6 +498,8 @@ CompilationCache::CacheLookupInternal CompilationCache::AddCacheEntry(
   return CacheLookupInternal{
       .executable_promise = entry->second.executable_promise(),
       .executable_future = entry->second.executable_future(),
+      .output_layouts_promise = entry->second.output_layouts_promise(),
+      .output_layouts_future = entry->second.output_layouts_future(),
       .needs_compilation = true,
       .dump_on_cache_miss = false,
   };
@@ -920,16 +946,27 @@ absl::StatusOr<CompiledKernel> CompilationCache::GetOrCompileImpl(
   // xla::CompileOptions.
   if (!cache_lookup.needs_compilation &&
       !cache_lookup.shape_dynamism_metadata.has_value()) {
+    std::vector<std::optional<CustomLayout>> non_default_output_layouts;
+    if (cache_lookup.output_layouts_future.valid()) {
+      non_default_output_layouts = cache_lookup.output_layouts_future.get();
+    }
     return CompiledKernel{
         .fixed_shape_kernel = cache_lookup.executable_future,
         .cache_hit = true,
-        .unbounded_dynamic_kernel = cache_lookup.unbounded_dynamic_kernel};
+        .unbounded_dynamic_kernel = cache_lookup.unbounded_dynamic_kernel,
+        .non_default_output_layouts = std::move(non_default_output_layouts)};
   }
 
+  std::vector<std::optional<CustomLayout>> hit_output_layouts;
+  if (!cache_lookup.needs_compilation &&
+      cache_lookup.output_layouts_future.valid()) {
+    hit_output_layouts = cache_lookup.output_layouts_future.get();
+  }
   CompiledKernel compiled_kernel{
       .fixed_shape_kernel = cache_lookup.executable_future,
       .cache_hit = !cache_lookup.needs_compilation,
-      .unbounded_dynamic_kernel = cache_lookup.unbounded_dynamic_kernel};
+      .unbounded_dynamic_kernel = cache_lookup.unbounded_dynamic_kernel,
+      .non_default_output_layouts = std::move(hit_output_layouts)};
   CompilationCacheKey storage_key = key;
   if (cache_lookup.shape_dynamism_metadata.has_value()) {
     // Create a key for the storage of the dynamic executable.
@@ -957,6 +994,10 @@ absl::StatusOr<CompiledKernel> CompilationCache::GetOrCompileImpl(
     if (const UnboundedDynamicKernel* kernel =
             cache_lookup.unbounded_dynamic_kernel;
         kernel != nullptr) {
+      if (cache_lookup.output_layouts_promise) {
+        TrySetOutputLayoutsPromise(storage_key,
+                                   *cache_lookup.output_layouts_promise, {});
+      }
       EnqueueCompilation(kernel->key, CacheEntryKind::kUnboundedDynamic,
                          kernel->build,
                          std::make_unique<xla::CompileOptions>());
@@ -969,6 +1010,10 @@ absl::StatusOr<CompiledKernel> CompilationCache::GetOrCompileImpl(
     // Only create the contexted module if we need to compile.
     auto contexted_module_or = ContextedModule::Make(computation_builder);
     if (!contexted_module_or.ok()) {
+      if (cache_lookup.output_layouts_promise) {
+        TrySetOutputLayoutsPromise(storage_key,
+                                   *cache_lookup.output_layouts_promise, {});
+      }
       TrySetExecutablePromise(storage_key, *cache_lookup.executable_promise,
                               contexted_module_or.status());
       return contexted_module_or.status();
@@ -980,6 +1025,47 @@ absl::StatusOr<CompiledKernel> CompilationCache::GetOrCompileImpl(
           DebugString(contexted_module_or->get(),
                       DebugStringOptions::kEnableDebugInfo)));
     }
+
+    std::vector<std::optional<CustomLayout>> non_default_output_layouts;
+    mlir::func::FuncOp main =
+        contexted_module_or->get().lookupSymbol<mlir::func::FuncOp>("main");
+    if (main) {
+      bool has_non_default = false;
+      std::vector<std::optional<CustomLayout>> candidate_layouts(
+          main.getNumResults());
+      for (size_t i = 0; i < main.getNumResults(); ++i) {
+        if (auto attr = main.getResultAttr(i, "mhlo.layout_mode")) {
+          if (auto str_attr = mlir::dyn_cast<mlir::StringAttr>(attr)) {
+            auto layout_mode_or =
+                xla::LayoutMode::FromString(str_attr.getValue().str());
+            if (layout_mode_or.ok() &&
+                layout_mode_or->user_layout.has_value()) {
+              CustomLayout custom_layout;
+              custom_layout.minor_to_major =
+                  CopyIntVector(layout_mode_or->user_layout->minor_to_major());
+              for (const auto& tile : layout_mode_or->user_layout->tiles()) {
+                custom_layout.tiles.push_back(CopyIntVector(tile.dimensions()));
+              }
+              custom_layout.element_size_in_bits =
+                  layout_mode_or->user_layout->element_size_in_bits();
+              candidate_layouts[i] = std::move(custom_layout);
+              has_non_default = true;
+            }
+          }
+        }
+      }
+      if (has_non_default) {
+        non_default_output_layouts = std::move(candidate_layouts);
+      }
+    }
+    if (cache_lookup.output_layouts_promise) {
+      TrySetOutputLayoutsPromise(storage_key,
+                                 *cache_lookup.output_layouts_promise,
+                                 non_default_output_layouts);
+    }
+    compiled_kernel.non_default_output_layouts =
+        std::move(non_default_output_layouts);
+
     // Reuse the caller-provided UniqueCompileOptions when available; otherwise
     // allocate an owning copy on the calling thread before enqueuing background
     // compilation.
